@@ -2,13 +2,21 @@
 scraper/service.py — LinkedIn scraping flow using the refactored modules.
 """
 
+import asyncio
 import logging
 import os
+import time
 from urllib.parse import quote
 
 from playwright.async_api import async_playwright
 
-from app.core.config import CONFIG, DEBUG_DIR
+from app.core.config import (
+    CONFIG,
+    DEBUG_DIR,
+    LOGIN_FORM_TIMEOUT_SEC,
+    LOGIN_PAGE_TIMEOUT_SEC,
+    MANUAL_VERIFICATION_TIMEOUT_SEC,
+)
 from app.scraper.browser import clear_session, launch_browser, save_session
 from app.scraper.human import full_scroll, human_type, random_mouse_move, random_sleep
 from app.services.ai_parser import parse_with_ai
@@ -21,6 +29,35 @@ from app.services.storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+_EMAIL_SELECTORS = [
+    "#username",
+    'input[name="session_key"]',
+    'input[autocomplete="username"]',
+    'input[type="email"]',
+    'input[name="username"]',
+]
+
+_PASSWORD_SELECTORS = [
+    "#password",
+    'input[name="session_password"]',
+    'input[autocomplete="current-password"]',
+    'input[type="password"]',
+]
+
+_SUBMIT_SELECTORS = [
+    'button[type="submit"]',
+    'button:has-text("Sign in")',
+    'button:has-text("Log in")',
+    'input[type="submit"]',
+]
+
+_CONSENT_SELECTORS = [
+    'button[action-type="ACCEPT"]',
+    'button:has-text("Accept")',
+    'button:has-text("Allow")',
+    'button:has-text("I agree")',
+]
 
 
 def _is_auth_redirect(url: str) -> bool:
@@ -137,6 +174,128 @@ async def _is_logged_in(page) -> bool:
     return "feed" in current
 
 
+async def _page_text_snippet(page, limit: int = 2000) -> str:
+    try:
+        snippet = await _evaluate_with_navigation_retry(
+            page,
+            f"() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, {limit})",
+        )
+        return (snippet or "").strip()
+    except Exception:
+        return ""
+
+
+async def _save_debug_artifacts(page, stem: str):
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    screenshot_path = os.path.join(DEBUG_DIR, f"{stem}.png")
+    html_path = os.path.join(DEBUG_DIR, f"{stem}.html")
+    text_path = os.path.join(DEBUG_DIR, f"{stem}.txt")
+
+    try:
+        await page.screenshot(path=screenshot_path, full_page=True)
+        logger.info("Screenshot saved to %s", os.path.relpath(screenshot_path))
+    except Exception as exc:
+        logger.warning("Could not save screenshot %s: %s", screenshot_path, exc)
+
+    try:
+        html = await page.content()
+        with open(html_path, "w", encoding="utf-8") as handle:
+            handle.write(html)
+    except Exception as exc:
+        logger.warning("Could not save HTML debug artifact %s: %s", html_path, exc)
+
+    try:
+        text = await _page_text_snippet(page, limit=4000)
+        with open(text_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except Exception as exc:
+        logger.warning("Could not save text debug artifact %s: %s", text_path, exc)
+
+
+async def _find_visible_selector(page, selectors: list[str]) -> str | None:
+    for selector in selectors:
+        try:
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
+                return selector
+        except Exception:
+            continue
+    return None
+
+
+async def _classify_login_page(page) -> tuple[str, str]:
+    current_url = page.url
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    snippet = await _page_text_snippet(page)
+    combined = f"{title}\n{snippet}".lower()
+
+    email_selector = await _find_visible_selector(page, _EMAIL_SELECTORS)
+    password_selector = await _find_visible_selector(page, _PASSWORD_SELECTORS)
+    if email_selector and password_selector:
+        return "login_form", "Login fields are visible"
+
+    if any(token in current_url.lower() for token in ("checkpoint", "challenge")):
+        return "challenge", "LinkedIn is showing a security checkpoint page"
+
+    if any(token in combined for token in (
+        "captcha",
+        "verify you are human",
+        "security verification",
+        "puzzle",
+        "let's do a quick security check",
+    )):
+        return "captcha", "LinkedIn is showing a CAPTCHA or human verification step"
+
+    if any(token in combined for token in ("sign in", "login", "welcome back")):
+        return "login_without_inputs", "Login page loaded without detectable username/password fields"
+
+    return "unknown", "LinkedIn returned an unexpected login/interstitial page"
+
+
+async def _dismiss_consent_dialogs(page):
+    for consent_selector in _CONSENT_SELECTORS:
+        try:
+            button = await page.query_selector(consent_selector)
+            if button and await button.is_visible():
+                await button.click()
+                logger.info("Dismissed consent dialog: %s", consent_selector)
+                await random_sleep(1, 2)
+                return
+        except Exception:
+            continue
+
+
+async def _wait_for_login_form(page) -> tuple[str, str]:
+    deadline = time.monotonic() + LOGIN_FORM_TIMEOUT_SEC
+
+    while time.monotonic() < deadline:
+        email_selector = await _find_visible_selector(page, _EMAIL_SELECTORS)
+        password_selector = await _find_visible_selector(page, _PASSWORD_SELECTORS)
+        if email_selector and password_selector:
+            return email_selector, password_selector
+
+        await asyncio.sleep(0.5)
+
+    page_kind, details = await _classify_login_page(page)
+    await _save_debug_artifacts(page, "login_timeout")
+    raise RuntimeError(
+        f"Login form not found after {LOGIN_FORM_TIMEOUT_SEC}s. URL: {page.url}. "
+        f"Detected state: {page_kind} ({details}). Check debug/login_timeout.png, .html, and .txt"
+    )
+
+
+async def _click_login_submit(page):
+    submit_selector = await _find_visible_selector(page, _SUBMIT_SELECTORS)
+    if not submit_selector:
+        raise RuntimeError("Login submit button not found on the page")
+
+    await random_mouse_move(page)
+    await page.click(submit_selector)
+
+
 async def _can_access_search(page) -> bool:
     probe_query = CONFIG.get("search_queries", ["developer"])[0]
     probe_url = _search_url_for_query(probe_query)
@@ -155,56 +314,38 @@ async def _can_access_search(page) -> bool:
 
 async def _do_login(page, context):
     logger.info("Navigating to login page...")
-    await _goto_allowing_partial_load(page, "https://www.linkedin.com/login", timeout=30000)
+    await _goto_allowing_partial_load(
+        page,
+        "https://www.linkedin.com/login",
+        timeout=LOGIN_PAGE_TIMEOUT_SEC * 1000,
+    )
     await random_sleep(3, 5)
 
     current_url = page.url
     logger.info("Login page URL: %s", current_url)
 
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-    await page.screenshot(path=os.path.join(DEBUG_DIR, "login_page.png"), full_page=True)
-    logger.info("Screenshot saved to debug/login_page.png")
+    await _save_debug_artifacts(page, "login_page")
 
     try:
-        for consent_selector in [
-            'button[action-type="ACCEPT"]',
-            'button:has-text("Accept")',
-            'button:has-text("Allow")',
-        ]:
-            try:
-                button = await page.query_selector(consent_selector)
-                if button:
-                    await button.click()
-                    logger.info("Dismissed consent dialog: %s", consent_selector)
-                    await random_sleep(1, 2)
-                    break
-            except Exception:
-                continue
-
-        await page.wait_for_selector("#username", state="visible", timeout=45000)
-
+        await _dismiss_consent_dialogs(page)
+        email_selector, password_selector = await _wait_for_login_form(page)
     except Exception as exc:
-        await page.screenshot(path=os.path.join(DEBUG_DIR, "login_timeout.png"), full_page=True)
         logger.error(
-            "Login form not found after 45s. URL: %s. Check debug screenshots.",
+            "Login form not found. URL: %s. Check debug artifacts.",
             page.url,
         )
-        raise RuntimeError(
-            f"Login form not found. URL: {page.url}. "
-            "LinkedIn may be showing a CAPTCHA — check debug/login_page.png"
-        ) from exc
+        raise RuntimeError(str(exc)) from exc
 
-    await page.fill("#username", "")
-    await page.fill("#password", "")
+    await page.fill(email_selector, "")
+    await page.fill(password_selector, "")
     await random_sleep(0.5, 1.0)
 
-    await human_type(page, "#username", CONFIG["email"])
+    await human_type(page, email_selector, CONFIG["email"])
     await random_sleep(0.5, 1.5)
-    await human_type(page, "#password", CONFIG["password"])
+    await human_type(page, password_selector, CONFIG["password"])
     await random_sleep(0.8, 1.8)
 
-    await random_mouse_move(page)
-    await page.click('[type="submit"]')
+    await _click_login_submit(page)
 
     try:
         await page.wait_for_function(
@@ -218,8 +359,13 @@ async def _do_login(page, context):
             timeout=60000,
         )
     except Exception as exc:
-        await page.screenshot(path=os.path.join(DEBUG_DIR, "after_submit.png"), full_page=True)
-        raise RuntimeError("Login timed out — no redirect after submitting credentials") from exc
+        await _save_debug_artifacts(page, "after_submit")
+        page_kind, details = await _classify_login_page(page)
+        raise RuntimeError(
+            "Login timed out after submitting credentials. "
+            f"Detected state: {page_kind} ({details}). "
+            "Check debug/after_submit.png, .html, and .txt"
+        ) from exc
 
     current_url = page.url
     if "feed" in current_url:
@@ -232,14 +378,19 @@ async def _do_login(page, context):
         logger.warning("URL: %s", current_url)
         await page.wait_for_function(
             "() => window.location.href.includes('feed')",
-            timeout=120000,
+            timeout=MANUAL_VERIFICATION_TIMEOUT_SEC * 1000,
         )
         logger.info("Manual verification completed")
         await save_session(context)
         return
 
-    await page.screenshot(path=os.path.join(DEBUG_DIR, "login_failed.png"), full_page=True)
-    raise RuntimeError(f"Login failed — unexpected URL: {current_url}")
+    await _save_debug_artifacts(page, "login_failed")
+    page_kind, details = await _classify_login_page(page)
+    raise RuntimeError(
+        f"Login failed — unexpected URL: {current_url}. "
+        f"Detected state: {page_kind} ({details}). "
+        "Check debug/login_failed.png, .html, and .txt"
+    )
 
 
 async def login(page, context, force_reauth: bool = False):

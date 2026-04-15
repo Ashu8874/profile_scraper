@@ -56,11 +56,14 @@ MAX_PROFILES_PER_RUN = _int("MAX_PROFILES_PER_RUN", 20)
 MAX_SEARCH_PAGES     = _int("MAX_SEARCH_PAGES", 10)
 MIN_DELAY            = _int("MIN_DELAY", 8)
 MAX_DELAY            = _int("MAX_DELAY", 20)
+LOGIN_PAGE_TIMEOUT_SEC = _int("LOGIN_PAGE_TIMEOUT_SEC", 30)
+LOGIN_FORM_TIMEOUT_SEC = _int("LOGIN_FORM_TIMEOUT_SEC", 45)
+MANUAL_VERIFICATION_TIMEOUT_SEC = _int("MANUAL_VERIFICATION_TIMEOUT_SEC", 180)
 
 # ─── AI / Ollama ──────────────────────────────────────────────────────────────
 
 OLLAMA_ENDPOINT = _endpoint_url("OLLAMA_ENDPOINT", "http://192.168.1.27:11434/api/generate")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3:8b")
 
 # ─── MongoDB ─────────────────────────────────────────────────────────────────
 
@@ -106,6 +109,9 @@ CONFIG = {
     "max_search_pages": MAX_SEARCH_PAGES,
     "min_delay": MIN_DELAY,
     "max_delay": MAX_DELAY,
+    "login_page_timeout_sec": LOGIN_PAGE_TIMEOUT_SEC,
+    "login_form_timeout_sec": LOGIN_FORM_TIMEOUT_SEC,
+    "manual_verification_timeout_sec": MANUAL_VERIFICATION_TIMEOUT_SEC,
 }
 
 SCHEDULER_CONFIG = {
