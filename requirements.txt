@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+playwright
+requests
+python-dotenv
+pymongo>=4.13,<5
+dnspython>=2.6.1,<3

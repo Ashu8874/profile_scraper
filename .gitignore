@@ -1,0 +1,16 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data (don't commit scraped data or sessions)
+data/
+debug/
+logs/
+output/
+session/
+
+# OS
+.DS_Store
