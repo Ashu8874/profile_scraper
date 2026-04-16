@@ -2,10 +2,11 @@
 scraper/browser.py — Browser lifecycle: launch, session load/save/clear, stealth.
 """
 
+import logging
 import os
 import random
-import logging
-from app.core.config import LEGACY_SESSION_PATH, SESSION_PATH
+
+from app.core.config import CONFIG, LEGACY_SESSION_PATH, SESSION_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ async def _apply_stealth(context):
 
 async def launch_browser(playwright):
     browser = await playwright.chromium.launch(
-        headless=False,
+        headless=CONFIG.get("browser_headless", False),
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -73,10 +74,13 @@ async def launch_browser(playwright):
     )
 
     ctx_kwargs = dict(
-        viewport={"width": random.randint(1200, 1400), "height": random.randint(700, 900)},
+        viewport={
+            "width": random.randint(CONFIG.get("browser_width_min", 1200), CONFIG.get("browser_width_max", 1400)),
+            "height": random.randint(CONFIG.get("browser_height_min", 700), CONFIG.get("browser_height_max", 900)),
+        },
         user_agent=random.choice(_USER_AGENTS),
-        locale="en-US",
-        timezone_id="America/New_York",
+        locale=CONFIG.get("browser_locale", "en-US"),
+        timezone_id=CONFIG.get("browser_timezone", "America/New_York"),
     )
 
     existing_session = _existing_session_path()

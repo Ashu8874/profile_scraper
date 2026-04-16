@@ -3,10 +3,11 @@ services/ai_parser.py — Parses LinkedIn profile text via local Ollama LLM.
 """
 
 import json
-import re
 import logging
+import re
+import time
 import requests
-from app.core.config import OLLAMA_ENDPOINT, OLLAMA_MODEL
+from app.core.config import OLLAMA_ENDPOINT, OLLAMA_MAX_RETRIES, OLLAMA_MODEL, OLLAMA_TIMEOUT_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,41 @@ def _salvage_profile_from_ai_output(text: str) -> dict:
     return profile
 
 
+def _call_ollama(prompt: str) -> str:
+    last_error = None
+
+    for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                OLLAMA_ENDPOINT,
+                json={
+                    "model":   OLLAMA_MODEL,
+                    "prompt":  prompt,
+                    "stream":  False,
+                    "options": {"temperature": 0.1, "num_predict": 1024},
+                },
+                timeout=OLLAMA_TIMEOUT_SEC,
+            )
+            response.raise_for_status()
+            return response.json().get("response", "")
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < OLLAMA_MAX_RETRIES:
+                logger.warning(
+                    "Ollama request attempt %s/%s failed: %s",
+                    attempt,
+                    OLLAMA_MAX_RETRIES,
+                    exc,
+                )
+                time.sleep(min(attempt * 2, 5))
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Ollama request failed unexpectedly")
+
+
 def parse_with_ai(text: str) -> dict:
     """
     Send profile text to Ollama and return structured dict.
@@ -283,19 +319,7 @@ LinkedIn Profile Text:
     cleaned   = ""
 
     try:
-        response = requests.post(
-            OLLAMA_ENDPOINT,
-            json={
-                "model":   OLLAMA_MODEL,
-                "prompt":  prompt,
-                "stream":  False,
-                "options": {"temperature": 0.1, "num_predict": 1024},
-            },
-            timeout=90,
-        )
-        response.raise_for_status()
-
-        ai_output = response.json().get("response", "")
+        ai_output = _call_ollama(prompt)
         logger.debug(f"Raw AI response: {ai_output[:300]}")
 
         cleaned = clean_json(ai_output)

@@ -59,11 +59,20 @@ MAX_DELAY            = _int("MAX_DELAY", 20)
 LOGIN_PAGE_TIMEOUT_SEC = _int("LOGIN_PAGE_TIMEOUT_SEC", 30)
 LOGIN_FORM_TIMEOUT_SEC = _int("LOGIN_FORM_TIMEOUT_SEC", 45)
 MANUAL_VERIFICATION_TIMEOUT_SEC = _int("MANUAL_VERIFICATION_TIMEOUT_SEC", 180)
+BROWSER_HEADLESS     = _bool("BROWSER_HEADLESS", False)
+BROWSER_LOCALE       = os.getenv("BROWSER_LOCALE", "en-US")
+BROWSER_TIMEZONE     = os.getenv("BROWSER_TIMEZONE", "America/New_York")
+BROWSER_WIDTH_MIN    = _int("BROWSER_WIDTH_MIN", 1200)
+BROWSER_WIDTH_MAX    = _int("BROWSER_WIDTH_MAX", 1400)
+BROWSER_HEIGHT_MIN   = _int("BROWSER_HEIGHT_MIN", 700)
+BROWSER_HEIGHT_MAX   = _int("BROWSER_HEIGHT_MAX", 900)
 
 # ─── AI / Ollama ──────────────────────────────────────────────────────────────
 
 OLLAMA_ENDPOINT = _endpoint_url("OLLAMA_ENDPOINT", "http://192.168.1.27:11434/api/generate")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3:8b")
+OLLAMA_TIMEOUT_SEC = _int("OLLAMA_TIMEOUT_SEC", 90)
+OLLAMA_MAX_RETRIES = _int("OLLAMA_MAX_RETRIES", 3)
 
 # ─── MongoDB ─────────────────────────────────────────────────────────────────
 
@@ -84,6 +93,12 @@ END_HOUR            = _int("END_HOUR", 21)
 JITTER_MINUTES      = _int("JITTER_MINUTES", 15)
 MIN_GAP_MINUTES     = _int("MIN_GAP_MINUTES", 90)
 TIMEZONE            = os.getenv("TIMEZONE", "Asia/Kolkata")
+
+# ─── App server ───────────────────────────────────────────────────────────────
+
+APP_HOST   = os.getenv("APP_HOST", "127.0.0.1")
+APP_PORT   = _int("APP_PORT", 1234)
+APP_RELOAD = _bool("APP_RELOAD", True)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -112,6 +127,13 @@ CONFIG = {
     "login_page_timeout_sec": LOGIN_PAGE_TIMEOUT_SEC,
     "login_form_timeout_sec": LOGIN_FORM_TIMEOUT_SEC,
     "manual_verification_timeout_sec": MANUAL_VERIFICATION_TIMEOUT_SEC,
+    "browser_headless": BROWSER_HEADLESS,
+    "browser_locale": BROWSER_LOCALE,
+    "browser_timezone": BROWSER_TIMEZONE,
+    "browser_width_min": BROWSER_WIDTH_MIN,
+    "browser_width_max": BROWSER_WIDTH_MAX,
+    "browser_height_min": BROWSER_HEIGHT_MIN,
+    "browser_height_max": BROWSER_HEIGHT_MAX,
 }
 
 SCHEDULER_CONFIG = {

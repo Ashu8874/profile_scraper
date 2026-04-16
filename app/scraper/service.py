@@ -59,6 +59,14 @@ _CONSENT_SELECTORS = [
     'button:has-text("I agree")',
 ]
 
+_PROFILE_BLOCKED_MARKERS = (
+    "join now",
+    "sign in",
+    "authwall",
+    "linkedin is better with a free account",
+    "join linkedin",
+)
+
 
 def _is_auth_redirect(url: str) -> bool:
     lowered = url.lower()
@@ -183,6 +191,12 @@ async def _page_text_snippet(page, limit: int = 2000) -> str:
         return (snippet or "").strip()
     except Exception:
         return ""
+
+
+async def _page_contains_markers(page, markers: tuple[str, ...], limit: int = 4000) -> bool:
+    snippet = await _page_text_snippet(page, limit=limit)
+    lower = snippet.lower()
+    return any(marker in lower for marker in markers)
 
 
 async def _save_debug_artifacts(page, stem: str):
@@ -430,19 +444,14 @@ async def _extract_links_from_page(page) -> list[str]:
 
 
 async def _search_page_looks_empty(page) -> bool:
-    text = await _evaluate_with_navigation_retry(
+    return await _page_contains_markers(
         page,
-        "() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 4000)",
-    )
-    lower = text.lower()
-    return any(
-        marker in lower
-        for marker in (
+        (
             "no results found",
             "try adjusting your search",
             "we couldn't find a match",
             "no matching people found",
-        )
+        ),
     )
 
 
@@ -539,6 +548,70 @@ async def _goto_search_results(page, context, query: str, page_num: int = 1):
             raise RuntimeError("LinkedIn search keeps redirecting to login after re-authentication")
 
 
+async def _open_profile_from_search_results(page, context, candidate: dict) -> bool:
+    query = candidate.get("source_query") or candidate.get("first_found_by") or "developer"
+    page_num = candidate.get("source_page_num") or 1
+    profile_key = candidate.get("profile_key")
+
+    if not profile_key:
+        return False
+
+    await _goto_search_results(page, context, query, page_num)
+    await random_sleep(2, 3)
+
+    selectors = [
+        f'a[href*="/in/{profile_key}"]',
+        f'a[href*="{profile_key}"]',
+    ]
+
+    for selector in selectors:
+        try:
+            link = await page.query_selector(selector)
+            if not link:
+                continue
+
+            href = await link.get_attribute("href")
+            if not href:
+                continue
+
+            await link.scroll_into_view_if_needed()
+            await random_sleep(1, 2)
+            await link.click()
+            await page.wait_for_load_state("domcontentloaded")
+            await random_sleep(3, 5)
+            if "/in/" not in page.url:
+                logger.warning("Search result click did not navigate to a profile URL: %s", page.url)
+                continue
+            logger.info("Opened profile via search result click: %s", page.url)
+            return True
+        except Exception as exc:
+            logger.warning("Could not open profile from search results via %s: %s", selector, exc)
+
+    return False
+
+
+async def _open_profile_page(page, context, candidate: dict, allow_reauth: bool = True):
+    url = candidate["url"]
+    opened_via_search = False
+
+    try:
+        opened_via_search = await _open_profile_from_search_results(page, context, candidate)
+    except Exception as exc:
+        logger.warning("Search-result profile open failed for %s: %s", url, exc)
+
+    if not opened_via_search:
+        await _goto_allowing_partial_load(page, url, timeout=30000)
+
+    await random_sleep(4, 8)
+
+    if _is_auth_redirect(page.url) or await _page_contains_markers(page, _PROFILE_BLOCKED_MARKERS):
+        if allow_reauth:
+            logger.warning("Profile page requires fresh authentication: %s", url)
+            await login(page, context, force_reauth=True)
+            return await _open_profile_page(page, context, candidate, allow_reauth=False)
+        raise RuntimeError("Profile page is blocked by LinkedIn auth wall")
+
+
 async def collect_new_links(page, context, required: int) -> tuple[list[dict], int]:
     new_links: dict[str, dict] = {}
     skipped_count = 0
@@ -589,6 +662,9 @@ async def collect_new_links(page, context, required: int) -> tuple[list[dict], i
                         "profile_key": profile_key,
                         "matched_keywords": [query],
                         "first_found_by": query,
+                        "source_query": query,
+                        "source_page_num": page_num,
+                        "source_search_url": page.url,
                     }
                     if len(new_links) >= required:
                         break
@@ -603,6 +679,14 @@ async def collect_new_links(page, context, required: int) -> tuple[list[dict], i
             )
 
             if len(new_links) >= required:
+                break
+
+            if page_num >= max_pages:
+                logger.info(
+                    "Reached configured search page limit (%s) for query '%s'",
+                    max_pages,
+                    query,
+                )
                 break
 
             if not await _go_to_next_page(page):
@@ -621,9 +705,8 @@ async def collect_new_links(page, context, required: int) -> tuple[list[dict], i
     return list(new_links.values())[:required], skipped_count
 
 
-async def scrape_profile(page, url: str) -> dict:
-    await page.goto(url, wait_until="domcontentloaded")
-    await random_sleep(4, 8)
+async def scrape_profile(page, context, candidate: dict) -> dict:
+    await _open_profile_page(page, context, candidate)
 
     await random_mouse_move(page)
     await full_scroll(page)
@@ -631,16 +714,20 @@ async def scrape_profile(page, url: str) -> dict:
     await random_mouse_move(page)
     await random_sleep(1, 3)
 
+    if _is_auth_redirect(page.url) or await _page_contains_markers(page, _PROFILE_BLOCKED_MARKERS):
+        return {"error": "Page text invalid — auth wall or empty page"}
+
     text: str = await _evaluate_with_navigation_retry(page, "() => document.body.innerText")
     return parse_with_ai(text)
 
 
-async def _scrape_profile_with_retries(page, url: str, attempts: int = 2) -> dict:
+async def _scrape_profile_with_retries(page, context, candidate: dict, attempts: int = 2) -> dict:
     last_exc = None
+    url = candidate["url"]
 
     for attempt in range(1, attempts + 1):
         try:
-            data = await scrape_profile(page, url)
+            data = await scrape_profile(page, context, candidate)
         except Exception as exc:
             last_exc = exc
             if attempt < attempts and _is_retryable_runtime_error(exc):
@@ -710,7 +797,7 @@ async def run_scraper() -> dict:
                 )
 
                 try:
-                    data = await _scrape_profile_with_retries(page, url)
+                    data = await _scrape_profile_with_retries(page, context, candidate)
                     if "error" in data and _is_retryable_profile_error(data["error"]):
                         logger.warning(
                             "Skipping transient failure without saving failed status: %s | %s",

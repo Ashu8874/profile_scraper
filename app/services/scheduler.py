@@ -54,6 +54,7 @@ class ScraperScheduler:
         self._task:         Optional[asyncio.Task] = None
         self._stop_event    = asyncio.Event()
         self._running_lock  = asyncio.Lock()
+        self._planned_runs: list[datetime] = []
 
     # ── Schedule building ─────────────────────────────────────────────────────
 
@@ -81,6 +82,7 @@ class ScraperScheduler:
             f"[Scheduler] Today's schedule ({len(times)} runs): "
             + ", ".join(t.strftime("%H:%M") for t in times)
         )
+        self._planned_runs = times
         return times
 
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -125,6 +127,7 @@ class ScraperScheduler:
             schedule = self._build_schedule()
 
             if not schedule:
+                self._planned_runs = []
                 tomorrow = (datetime.now(self.tz) + timedelta(days=1)).replace(
                     hour=0, minute=1, second=0, microsecond=0
                 )
@@ -145,6 +148,7 @@ class ScraperScheduler:
                 await self._execute_job(job)
 
             if not self._stop_event.is_set():
+                self._planned_runs = []
                 midnight = (datetime.now(self.tz) + timedelta(days=1)).replace(
                     hour=0, minute=1, second=0, microsecond=0
                 )
@@ -169,11 +173,18 @@ class ScraperScheduler:
 
     def get_status(self) -> dict:
         now      = datetime.now(self.tz)
-        next_job = next((j for j in self.jobs if j.status == JobStatus.PENDING), None)
+        next_job = next(
+            (j for j in self.jobs if j.status == JobStatus.PENDING and j.scheduled_at >= now),
+            None,
+        )
+        next_run = next_job.scheduled_at if next_job else next(
+            (run_time for run_time in self._planned_runs if run_time >= now),
+            None,
+        )
         return {
             "active":            not self._stop_event.is_set(),
             "currently_running": self._running_lock.locked(),
-            "next_run":          next_job.scheduled_at.isoformat() if next_job else None,
+            "next_run":          next_run.isoformat() if next_run else None,
             "timezone":          TIMEZONE,
             "runs_per_day":      RUNS_PER_DAY,
             "profiles_per_run":  MAX_PROFILES_PER_RUN,
