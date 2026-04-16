@@ -59,6 +59,21 @@ _CONSENT_SELECTORS = [
     'button:has-text("I agree")',
 ]
 
+_LOGIN_ENTRY_SELECTORS = [
+    'a[href*="/login"]',
+    'a[href*="/uas/login"]',
+    'button:has-text("Sign in")',
+    'button:has-text("Log in")',
+    'a:has-text("Sign in")',
+    'a:has-text("Log in")',
+]
+
+_LOGIN_URLS = [
+    "https://www.linkedin.com/login",
+    "https://www.linkedin.com/uas/login",
+    "https://www.linkedin.com/checkpoint/lg/sign-in-another-account",
+]
+
 _PROFILE_BLOCKED_MARKERS = (
     "join now",
     "sign in",
@@ -226,14 +241,22 @@ async def _save_debug_artifacts(page, stem: str):
         logger.warning("Could not save text debug artifact %s: %s", text_path, exc)
 
 
-async def _find_visible_selector(page, selectors: list[str]) -> str | None:
-    for selector in selectors:
-        try:
-            element = await page.query_selector(selector)
-            if element and await element.is_visible():
-                return selector
-        except Exception:
-            continue
+def _candidate_frames(page):
+    try:
+        return list(page.frames)
+    except Exception:
+        return []
+
+
+async def _find_visible_selector(page, selectors: list[str]) -> tuple[object, str] | None:
+    for frame in _candidate_frames(page):
+        for selector in selectors:
+            try:
+                element = await frame.query_selector(selector)
+                if element and await element.is_visible():
+                    return frame, selector
+            except Exception:
+                continue
     return None
 
 
@@ -246,9 +269,9 @@ async def _classify_login_page(page) -> tuple[str, str]:
     snippet = await _page_text_snippet(page)
     combined = f"{title}\n{snippet}".lower()
 
-    email_selector = await _find_visible_selector(page, _EMAIL_SELECTORS)
-    password_selector = await _find_visible_selector(page, _PASSWORD_SELECTORS)
-    if email_selector and password_selector:
+    email_match = await _find_visible_selector(page, _EMAIL_SELECTORS)
+    password_match = await _find_visible_selector(page, _PASSWORD_SELECTORS)
+    if email_match and password_match:
         return "login_form", "Login fields are visible"
 
     if any(token in current_url.lower() for token in ("checkpoint", "challenge")):
@@ -271,25 +294,75 @@ async def _classify_login_page(page) -> tuple[str, str]:
 
 async def _dismiss_consent_dialogs(page):
     for consent_selector in _CONSENT_SELECTORS:
-        try:
-            button = await page.query_selector(consent_selector)
-            if button and await button.is_visible():
-                await button.click()
-                logger.info("Dismissed consent dialog: %s", consent_selector)
+        for frame in _candidate_frames(page):
+            try:
+                button = await frame.query_selector(consent_selector)
+                if button and await button.is_visible():
+                    await button.click()
+                    logger.info("Dismissed consent dialog: %s", consent_selector)
+                    await random_sleep(1, 2)
+                    return
+            except Exception:
+                continue
+
+
+async def _activate_login_entrypoint(page) -> bool:
+    for frame in _candidate_frames(page):
+        for selector in _LOGIN_ENTRY_SELECTORS:
+            try:
+                entry = await frame.query_selector(selector)
+                if not entry or not await entry.is_visible():
+                    continue
+
+                await entry.scroll_into_view_if_needed()
                 await random_sleep(1, 2)
-                return
-        except Exception:
+                await entry.click()
+                await random_sleep(2, 3)
+                logger.info("Activated LinkedIn login entry point: %s", selector)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+async def _load_alternate_login_url(page) -> bool:
+    current = page.url.rstrip("/")
+    for url in _LOGIN_URLS:
+        if url.rstrip("/") == current:
             continue
+        try:
+            await _goto_allowing_partial_load(page, url, timeout=LOGIN_PAGE_TIMEOUT_SEC * 1000)
+            await random_sleep(2, 3)
+            logger.info("Tried alternate login URL: %s", url)
+            return True
+        except Exception as exc:
+            logger.warning("Alternate login URL failed %s: %s", url, exc)
+    return False
 
 
-async def _wait_for_login_form(page) -> tuple[str, str]:
+async def _wait_for_login_form(page) -> tuple[object, str, object, str]:
     deadline = time.monotonic() + LOGIN_FORM_TIMEOUT_SEC
+    alternate_url_tried = False
+    entrypoint_clicked = False
 
     while time.monotonic() < deadline:
-        email_selector = await _find_visible_selector(page, _EMAIL_SELECTORS)
-        password_selector = await _find_visible_selector(page, _PASSWORD_SELECTORS)
-        if email_selector and password_selector:
-            return email_selector, password_selector
+        email_match = await _find_visible_selector(page, _EMAIL_SELECTORS)
+        password_match = await _find_visible_selector(page, _PASSWORD_SELECTORS)
+        if email_match and password_match:
+            email_frame, email_selector = email_match
+            password_frame, password_selector = password_match
+            return email_frame, email_selector, password_frame, password_selector
+
+        page_kind, _ = await _classify_login_page(page)
+        if page_kind == "login_without_inputs" and not entrypoint_clicked:
+            entrypoint_clicked = await _activate_login_entrypoint(page)
+            if entrypoint_clicked:
+                continue
+
+        if page_kind in {"login_without_inputs", "unknown"} and not alternate_url_tried:
+            alternate_url_tried = await _load_alternate_login_url(page)
+            if alternate_url_tried:
+                continue
 
         await asyncio.sleep(0.5)
 
@@ -302,12 +375,13 @@ async def _wait_for_login_form(page) -> tuple[str, str]:
 
 
 async def _click_login_submit(page):
-    submit_selector = await _find_visible_selector(page, _SUBMIT_SELECTORS)
-    if not submit_selector:
+    submit_match = await _find_visible_selector(page, _SUBMIT_SELECTORS)
+    if not submit_match:
         raise RuntimeError("Login submit button not found on the page")
 
+    submit_frame, submit_selector = submit_match
     await random_mouse_move(page)
-    await page.click(submit_selector)
+    await submit_frame.click(submit_selector)
 
 
 async def _can_access_search(page) -> bool:
@@ -330,7 +404,7 @@ async def _do_login(page, context):
     logger.info("Navigating to login page...")
     await _goto_allowing_partial_load(
         page,
-        "https://www.linkedin.com/login",
+        _LOGIN_URLS[0],
         timeout=LOGIN_PAGE_TIMEOUT_SEC * 1000,
     )
     await random_sleep(3, 5)
@@ -342,7 +416,7 @@ async def _do_login(page, context):
 
     try:
         await _dismiss_consent_dialogs(page)
-        email_selector, password_selector = await _wait_for_login_form(page)
+        email_frame, email_selector, password_frame, password_selector = await _wait_for_login_form(page)
     except Exception as exc:
         logger.error(
             "Login form not found. URL: %s. Check debug artifacts.",
@@ -350,13 +424,13 @@ async def _do_login(page, context):
         )
         raise RuntimeError(str(exc)) from exc
 
-    await page.fill(email_selector, "")
-    await page.fill(password_selector, "")
+    await email_frame.fill(email_selector, "")
+    await password_frame.fill(password_selector, "")
     await random_sleep(0.5, 1.0)
 
-    await human_type(page, email_selector, CONFIG["email"])
+    await human_type(email_frame, email_selector, CONFIG["email"])
     await random_sleep(0.5, 1.5)
-    await human_type(page, password_selector, CONFIG["password"])
+    await human_type(password_frame, password_selector, CONFIG["password"])
     await random_sleep(0.8, 1.8)
 
     await _click_login_submit(page)
