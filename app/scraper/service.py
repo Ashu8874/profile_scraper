@@ -88,6 +88,11 @@ def _is_auth_redirect(url: str) -> bool:
     return "login" in lowered or "authwall" in lowered or "uas" in lowered
 
 
+def _is_search_results_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "linkedin.com/search/results/people" in lowered
+
+
 def _is_retryable_profile_error(message: str) -> bool:
     lowered = (message or "").lower()
     return any(
@@ -397,7 +402,10 @@ async def _can_access_search(page) -> bool:
 
     current = page.url
     logger.info("Search access probe URL: %s", current)
-    return not _is_auth_redirect(current)
+    if _is_auth_redirect(current):
+        return False
+
+    return _is_search_results_url(current)
 
 
 async def _do_login(page, context):
@@ -607,19 +615,20 @@ async def _goto_search_results(page, context, query: str, page_num: int = 1):
     await _goto_allowing_partial_load(page, search_url, timeout=30000)
     await random_sleep(3, 5)
 
-    if _is_auth_redirect(page.url):
+    if not _is_search_results_url(page.url):
         logger.warning(
-            "LinkedIn redirected search query '%s' page %s to auth. Re-authenticating.",
+            "LinkedIn did not open search results for query '%s' page %s. Current URL: %s. Re-authenticating.",
             query,
             page_num,
+            page.url,
         )
         await login(page, context, force_reauth=True)
         await _goto_allowing_partial_load(page, search_url, timeout=30000)
         await random_sleep(3, 5)
 
-        if _is_auth_redirect(page.url):
-            logger.error("Search still redirects to auth after re-login — URL: %s", page.url)
-            raise RuntimeError("LinkedIn search keeps redirecting to login after re-authentication")
+        if not _is_search_results_url(page.url):
+            logger.error("Search still unavailable after re-login — URL: %s", page.url)
+            raise RuntimeError("LinkedIn search is unavailable after re-authentication")
 
 
 async def _open_profile_from_search_results(page, context, candidate: dict) -> bool:

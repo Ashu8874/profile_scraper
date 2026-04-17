@@ -197,11 +197,60 @@ async def upsert_profile(profile: dict, matched_keywords: Iterable[str], first_f
     first_keyword = (first_found_by or "").strip() or (keywords[0] if keywords else "")
     last_keyword = keywords[-1] if keywords else first_keyword
     now = _utcnow()
+    is_failed_profile = bool((profile.get("error") or "").strip())
 
-    if "error" in profile:
-        raise ValueError("Failed profiles are not stored in MongoDB")
-    if not _is_meaningful_profile(profile):
+    if not is_failed_profile and not _is_meaningful_profile(profile):
         raise ValueError("Profile has no meaningful data to store")
+
+    if is_failed_profile:
+        set_fields = {
+            "profile_key": profile_key,
+            "url": url,
+            "status": "failed",
+            "error": (profile.get("error") or "").strip(),
+            "raw": (profile.get("raw") or "").strip(),
+            "last_found_by": last_keyword,
+            "last_seen_at": now,
+            "scraped_at": now,
+            "updated_at": now,
+            "source": "linkedin",
+        }
+
+        update = {
+            "$set": set_fields,
+            "$setOnInsert": {
+                "created_at": now,
+                "first_seen_at": now,
+                "first_found_by": first_keyword,
+            },
+        }
+
+        if keywords:
+            update["$addToSet"] = {"matched_keywords": {"$each": keywords}}
+
+        result = await collection.update_one(
+            {"profile_key": profile_key},
+            update,
+            upsert=True,
+        )
+
+        stored_profile = {
+            "url": url,
+            "profile_key": profile_key,
+            "matched_keywords": keywords,
+            "first_found_by": first_keyword,
+            "last_found_by": last_keyword,
+            "status": "failed",
+            "error": set_fields["error"],
+            "raw": set_fields["raw"],
+            "scraped_at": now,
+            "updated_at": now,
+        }
+
+        return {
+            "created": result.upserted_id is not None,
+            "profile": stored_profile,
+        }
 
     set_fields = {
         "profile_key": profile_key,
